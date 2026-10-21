@@ -1,6 +1,6 @@
 import { TestFunction, test, expect } from "vitest";
-import { randInt } from "../../../src/utils/randomNumber";
-import arrayEquals from "../../../src/utils/arrayEquals";
+import { randInt } from "../../src/utils/randomNumber";
+import arrayEquals from "../../src/utils/arrayEquals";
 
 const ARRAY_TEST_COUNT = 1_000;
 const MIN_ARR_LENGTH = 50;

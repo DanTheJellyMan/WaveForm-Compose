@@ -3,8 +3,6 @@ struct ComplexPair {
     imag: f32
 }
 
-const PI: f32 = 245850922.0 / 78256779.0;
-
 @group(0) @binding(1)
 var<storage, read> audio_samples: array<f32>;
 @group(0) @binding(2)

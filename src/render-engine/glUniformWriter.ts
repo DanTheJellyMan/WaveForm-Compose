@@ -1,11 +1,27 @@
 import { WgslReflect, VariableInfo, MemberInfo } from "wgsl_reflect";
 
+export type NestedArray<T> = T | NestedArray<T>[];
+export type NumberFormat = "Int8" | "Int16" | "Int32" | "Int64" | "Uint8" | "Uint16" | "Uint32" | "BigUint64" | "Float16" | "Float32" | "Float64";
 export type OutputData = {
     byteData: ArrayBuffer,
-    gpuBufOffset: number
+    gpuBufOffset: number,
+    numFormat: NumberFormat
 };
 
-type NestedNumberArray = number[] | NestedNumberArray[];
+/* Outline of how writer works:
+    Starting from the GlobalUniforms struct, search through each member according
+    to the given target member name (dot separated) to find what data type needs
+    to be set into the GPU buffer (f32, u32, etc.).
+
+    If target member is scalar, simply write the single value for it in the view.
+
+    If target member is a vector or matrix, set all the inputted values correctly
+    formatted in the view.
+
+    If target member is another struct, recursively go through each member until
+    there is no longer a struct and begin setting the corresponding input values
+    in the view. Must also accomodate for alignment.
+*/
 
 /**
  * Determines where and how the inputted data should be written into the GPUBuffer
@@ -47,31 +63,71 @@ export default function glUniformWriter(
     }
     tMemInfo = nextGlUniMem as MemberInfo;
 
-    // TODO: add support for non-scalar value types
-    let abSize = 0;
-    let viewFnN: keyof DataView;
-    switch(tMemInfo.type.name) {
-        case "f32":
-            abSize = Float32Array.BYTES_PER_ELEMENT;
-            viewFnN = "setFloat32";
-            break;
-        case "i32":
-            abSize = Int32Array.BYTES_PER_ELEMENT;
-            viewFnN = "setInt32";
-            break;
-        case "u32":
-            abSize = Uint32Array.BYTES_PER_ELEMENT;
-            viewFnN = "setUint32";
-            break;
-        default:
-            throw new Error(`Unsupported data type: ${tMemInfo.type.name}`);
+    const tMemNumFormat = getNumberFormat(tMemInfo.type);
+    let view: DataView;
+    if (tMemNumFormat !== "") {
+        const viewByteLen = getNumberFormatByteLength(tMemNumFormat);
+        view = new DataView(
+            new ArrayBuffer(viewByteLen, { maxByteLength: viewByteLen })
+        );
+        const viewSetter = view[`set${tMemNumFormat}`];
+        viewSetter(0, values[0], true);
+    } else {
+        const typeN = tMemInfo.type.name;
+        const isVec = typeN === "vec";
+        const matC = parseInt(typeN.charAt(3));
+        const matR = parseInt(typeN.charAt(5));
+        const isMat = typeN.substring(0,3) === "mat" &&
+            typeN.charAt(4) === "x" && (
+                !isNaN(matC) &&
+                !isNaN(matR)
+            );
+        
+        let align: number;
+        if (isVec || isMat) {
+
+            if (isMat) {
+
+            }
+
+            const format = tMemInfo.format!;
+            console.log(format);
+        } else if (tMemInfo.type.isStruct) {
+            // console.log(tMemInfo);
+            // const dvSetFnInfo = getDataViewSetFn();
+        }
     }
-    const ab = new ArrayBuffer(abSize);
-    const view = new DataView(ab);
-    view[viewFnN](0, values[0], true);
 
     return {
-        byteData: ab,
-        gpuBufOffset
+        byteData: view.buffer,
+        gpuBufOffset,
+        numFormat
     };
+}
+
+function getNumberFormat(
+    memTypeInfo: Exclude<MemberInfo["type"] | MemberInfo["format"], null>
+) {
+    let numFormat: NumberFormat | "";
+
+    switch(memTypeInfo.name) {
+        case "f32":
+            numFormat = "Float32";
+            break;
+        case "i32":
+            numFormat = "Int32";
+            break;
+        case "u32":
+            numFormat = "Uint32";
+            break;
+        default:
+            numFormat = "";
+    }
+
+    return numFormat;
+}
+
+function getNumberFormatByteLength(numFormat: NumberFormat): number {
+    const bitLenStr = numFormat.substring(numFormat.indexOf("t", 2));
+    return Math.round(parseInt(bitLenStr) / 8);
 }

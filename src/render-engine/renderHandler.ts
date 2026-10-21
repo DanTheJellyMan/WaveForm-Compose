@@ -312,8 +312,7 @@ export async function getShaderTimestampLogs(
 ) {
     const readBufSize = tsQuerySetReadBuf.size;
     await tsQuerySetReadBuf.mapAsync(GPUMapMode.READ, 0, readBufSize);
-    const tsAb = tsQuerySetReadBuf.getMappedRange(0, readBufSize);
-    const tsAbCpy = tsAb.slice();
+    const tsAbCpy = tsQuerySetReadBuf.getMappedRange(0, readBufSize).slice();
     tsQuerySetReadBuf.unmap();
 
     const tsArr = new BigUint64Array(tsAbCpy);

@@ -1,6 +1,6 @@
 import { TestFunction, test, expect } from "vitest";
-import { randInt, randFloat } from "../../../src/utils/randomNumber";
-import { NumberWrapperTypes, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64, Float16, Float32, Float64 } from "../../../src/utils/numberWrappers";
+import { randInt, randFloat } from "../../src/utils/randomNumber";
+import { NumberWrapperTypes, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64, Float16, Float32, Float64 } from "../../src/utils/numberWrappers";
 
 const NUMBER_TEST_COUNT = 1_000;
 console.log(`Number wrapper test iterations: ${NUMBER_TEST_COUNT}`);
