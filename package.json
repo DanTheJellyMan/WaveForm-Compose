@@ -34,6 +34,10 @@
     "vitest": "^4.1.7"
   },
   "dependencies": {
-    "wgsl_reflect": "^1.5.0"
+    "@luma.gl/core": "^9.4.2",
+    "@luma.gl/engine": "^9.4.2",
+    "@luma.gl/shadertools": "^9.4.2",
+    "@luma.gl/webgpu": "^9.4.2",
+    "wgsl_reflect": "^1.6.0"
   }
 }

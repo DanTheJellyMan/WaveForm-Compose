@@ -1,129 +1,291 @@
-import { Float32 } from "../utils/numberWrappers";
-import arrayEquals from "../utils/arrayEquals";
-import { WgslReflect, ResourceType } from "wgsl_reflect";
-import glUniWriter from "./glUniformWriter";
+import { luma, UniformStore, UniformBlock, CompositeShaderType, Buffer } from "@luma.gl/core";
+import { webgpuAdapter } from "@luma.gl/webgpu";
+import {  } from "@luma.gl/shadertools";
+import { Computation, Model } from "@luma.gl/engine";
+
+import { MemberInfo, WgslReflect } from "wgsl_reflect";
+import COMMON_SHADER_SRC from "../common.wgsl?raw";
+import FFT_SHADER_SRC from "../analyser/fft.wgsl?raw";
+import RENDER_SHADER_SRC from "./render.wgsl?raw";
+const FFT_SHADER_FSRC = `${COMMON_SHADER_SRC}\n\n${FFT_SHADER_SRC}`;
+const RENDER_SHADER_FSRC = `${COMMON_SHADER_SRC}\n\n${RENDER_SHADER_SRC}`;
+
 import AudioDataManager, { Process, ProcessInfo } from "../analyser/AudioDataManager";
 import AbQueue from "../utils/ArrayBufferQueue";
-import commonShaderCode from "../common.wgsl?raw";
-import fftShaderCode from "../analyser/fft.wgsl?raw";
-import renderShaderCode from "./render.wgsl?raw";
+import { Float32 } from "../utils/numberWrappers";
+import arrayEquals from "../utils/arrayEquals";
 
-export type RenderFnState = {
-    commonReflect: WgslReflect,
-    tsQuerySet: GPUQuerySet,
-    bufs: ReturnType<typeof createReqBuffers>,
-    lyts: ReturnType<typeof createReqLayouts>,
-    grps: ReturnType<typeof createReqGroups>,
-    pipes: ReturnType<typeof createReqPipelines>,
-    sampAbQueue: AbQueue,
-    sampChanged: boolean,
-    logs: {
-        lastLogTs: number
-    },
-    lastFFTSize: number,
-};
+export type RenderFnState = ReturnType<typeof prepRenderer>;
 
-export const adapter = await navigator.gpu.requestAdapter();
-if (!adapter) throw new Error("Failed to retrieve GPU Adapter");
+if (!webgpuAdapter.isSupported()) {
+    throw new Error("WebGPU adapter is not supported");
+}
 
-const tsQueryEnabled = adapter.features.has("timestamp-query");
+export const device = await luma.createDevice({
+    type: "webgpu",
+    adapters: [webgpuAdapter],
+    featureLevel: "max",
+    powerPreference: "high-performance"
+});
+
+// TODO: timestamp query sets cannot be created if this is false, so
+// handle that behavior in the code.
+const tsQueryEnabled = device.features.has("timestamp-query");
 if (!tsQueryEnabled) {
     console.warn("Timestamp query is not supported");
 } else {
-    console.log("Timestamp query is supported");
+    console.info("Timestamp query is supported");
 }
 
-export const device = await adapter.requestDevice({
-    requiredFeatures: [
-        (tsQueryEnabled ? "timestamp-query" : null)
-    ].filter((value) => value !== "" && value !== null) as GPUFeatureName[]
-});
-
 export let sab: SharedArrayBuffer | null = null;
-export let ctx: GPUCanvasContext | null = null;
 
 /**
  * @param buf 
  * @param canvas 
- * @returns Render function
+ * @returns
  */
 export function init(
     buf: SharedArrayBuffer,
     canvas: OffscreenCanvas
 ): RenderFnState {
-    sab = buf;
-
-    const context = canvas.getContext("webgpu") as GPUCanvasContext | null;
-    if (!navigator.gpu) {
-        throw new Error("WebGPU not supported");
-    } else if (context === null) {
-        throw new Error("Failed to get webgpu context from canvas");
+    if (sab) {
+        throw new Error("Already initialized render handler");
     }
-    ctx = context;
 
-    ctx.configure({
-        device,
-        format: navigator.gpu.getPreferredCanvasFormat(),
+    sab = buf;
+    device.canvasContext = device.createCanvasContext({
+        canvas,
         alphaMode: "premultiplied"
     });
-    console.log("WebGPU canvas configured");
+    console.log("Canvas context created");
 
     const renderState = prepRenderer();
     return renderState;
 }
 
 function prepRenderer() {
-    const fftShaderModCode = `${commonShaderCode}\n\n${fftShaderCode}`;
-    const fftShaderMod = device.createShaderModule({
-        code: fftShaderModCode
-    });
-    const renderShaderModCode = `${commonShaderCode}\n\n${renderShaderCode}`;
-    const renderShaderMod = device.createShaderModule({
-        code: renderShaderModCode
-    });
-    Promise.all([
-        fftShaderMod.getCompilationInfo(),
-        renderShaderMod.getCompilationInfo()
-    ])
-    .then((infos) => {
-        console.info("shader module compilation info:");
-        infos.forEach((info) => console.info(...info.messages));
-    });
-
-    const commonReflect = new WgslReflect(commonShaderCode);
-    const commonShaderStatus = validateCommonShader(commonReflect);
-    if (commonShaderStatus !== 0) {
-        throw new Error(`${commonShaderStatus}`);
+    const commonReflect = new WgslReflect(COMMON_SHADER_SRC);
+    const glUniParsedTypes = parseStructType(commonReflect, "GlobalUniforms");
+    if (!glUniParsedTypes) {
+        throw new Error(
+            `GlobalUniforms struct doesn't exist in common shader:\n`+
+            COMMON_SHADER_SRC
+        );
     }
-
+    const glUniStore = new UniformStore(device, {
+        gl_uniforms: {
+            layout: "wgsl-uniform",
+            uniformTypes: glUniParsedTypes
+        }
+    });
     const tsQuerySet = device.createQuerySet({
         count: 8,
         type: "timestamp"
     });
-    const bufs = createReqBuffers(commonReflect, tsQuerySet);
-    const lyts = createReqLayouts();
-    const grps = createReqGroups(bufs, lyts);
-    const pipes = createReqPipelines(fftShaderMod, renderShaderMod, lyts);
+    
+    const MAX_FFT_SIZE = 2 ** AudioDataManager.FFT_RATIO_MAX.value;
+    const glUniBuf = glUniStore.getManagedUniformBuffer("gl_uniforms");
+    const audioSampBuf = device.createBuffer({
+        byteLength: MAX_FFT_SIZE * Float32.BYTES,
+        usage: Buffer.STORAGE | Buffer.COPY_DST | Buffer.COPY_SRC
+    });
+    const complexSampBuf = device.createBuffer({
+        byteLength: audioSampBuf.byteLength * 2,
+        usage: audioSampBuf.usage
+    });
+    const fftBuf = device.createBuffer({
+        byteLength: complexSampBuf.byteLength,
+        usage: audioSampBuf.usage
+    });
 
-    const maxFFTSize = 2 ** AudioDataManager.FFT_RATIO_MAX.value;
-    const sampAbQueue = new AbQueue([new ArrayBuffer(maxFFTSize * Float32Array.BYTES_PER_ELEMENT)]);
+    const stageAlign = device.limits.minUniformBufferOffsetAlignment;
+    const stageCt = Math.log2(MAX_FFT_SIZE);
+    const stageUniBuf = device.createBuffer({
+        byteLength: stageAlign * stageCt,
+        usage: glUniBuf.usage
+    });
+    for (let stage=0; stage<stageCt; stage++) {
+        const value = new Uint32Array([stage]);
+        stageUniBuf.write(value.buffer, stage * stageAlign);
+    }
 
-    const startingRenderState: RenderFnState = {
+    const magBuf = device.createBuffer({
+        byteLength: audioSampBuf.byteLength,
+        usage: audioSampBuf.usage
+    });
+
+    const preprocSampComp = new Computation(device, {
+        source: FFT_SHADER_FSRC,
+        entryPoint: "preproc_samps",
+        shaderLayout: {
+            bindings: [
+                {
+                    name: "gl_uniforms",
+                    type: "uniform",
+                    group: 0,
+                    location: 0
+                },
+                {
+                    name: "audio_samps",
+                    type: "read-only-storage",
+                    group: 0,
+                    location: 1
+                },
+                {
+                    name: "complex_samps",
+                    type: "storage",
+                    group: 0,
+                    location: 2
+                }
+            ]
+        },
+        bindings: {
+            gl_uniforms: { buffer: glUniBuf },
+            audio_samps: { buffer: audioSampBuf },
+            complex_samps: { buffer: complexSampBuf }
+        }
+    });
+    const compFFTComp = new Computation(device, {
+        source: FFT_SHADER_FSRC,
+        entryPoint: "fft_stage",
+        shaderLayout: {
+            bindings: [
+                {
+                    name: "gl_uniforms",
+                    type: "uniform",
+                    group: 0,
+                    location: 0
+                },
+                {
+                    name: "fft_in",
+                    type: "read-only-storage",
+                    group: 1,
+                    location: 1
+                },
+                {
+                    name: "fft_out",
+                    type: "storage",
+                    group: 1,
+                    location: 2
+                },
+                {
+                    name: "stage_uni",
+                    type: "uniform",
+                    group: 1,
+                    location: 3
+                }
+            ]
+        },
+        bindings: {
+            gl_uniforms: { buffer: glUniBuf },
+            fft_in: { buffer: complexSampBuf },
+            fft_out: { buffer: fftBuf },
+            stage_uni: { buffer: stageUniBuf }
+        }
+    });
+    const compMagComp = new Computation(device, {
+        source: FFT_SHADER_FSRC,
+        entryPoint: "comp_mag",
+        shaderLayout: {
+            bindings: [
+                {
+                    name: "gl_uniforms",
+                    type: "uniform",
+                    group: 0,
+                    location: 0
+                },
+                {
+                    name: "mag_in",
+                    type: "read-only-storage",
+                    group: 2,
+                    location: 1
+                },
+                {
+                    name: "mag_out",
+                    type: "storage",
+                    group: 2,
+                    location: 2
+                }
+            ]
+        },
+        bindings: {
+            gl_uniforms: { buffer: glUniBuf },
+            mag_in: { buffer: fftBuf },
+            mag_out: { buffer: magBuf }
+        }
+    });
+
+    const sampAbQueue = new AbQueue();
+    const renderModel = new Model(device, {
+        source: RENDER_SHADER_FSRC,
+        vertexEntryPoint: "vert_main",
+        fragmentEntryPoint: "frag_main",
+        vertexCount: 6,
+        bindings: {
+            gl_uniforms: { buffer: glUniBuf },
+            samps_db: { buffer: magBuf }
+        }
+    });
+    
+    return {
         commonReflect,
-        tsQuerySet,
-        bufs,
-        lyts,
-        grps,
-        pipes,
-        sampAbQueue,
         sampChanged: true,
+        lastFFTSize: 0,
         logs: {
             lastLogTs: 0
         },
-        lastFFTSize: 0,
+        glUniStore,
+        tsQuerySet,
+        bufs: {
+            audioSampBuf,
+            complexSampBuf,
+            fftBuf,
+            stageUniBuf,
+            magBuf
+        },
+        comps: {
+            preprocSampComp,
+            compFFTComp,
+            compMagComp
+        },
+        sampAbQueue,
+        models: {
+            renderModel
+        }
     };
+}
 
-    return startingRenderState;
+function parseStructType(
+    reflect: WgslReflect,
+    structN: string
+): Record<string, CompositeShaderType> | null {
+    const objType = {};
+    const structInfo = reflect.getStructInfo(structN);
+    if (!structInfo) {
+        return null;
+    }
+
+    const queue = [[objType, structInfo.name, structInfo.members]];
+    while (queue.length > 0) {
+        const [ parentObj, memN, submems ] = queue.shift()! as
+            [Record<string, CompositeShaderType>, string, MemberInfo[]];
+
+        for (const submem of submems) {
+            const submemN = submem.name;
+            const submemMems = submem.members;
+
+            if (!submemMems) {
+                parentObj[submemN] = submem.type.getTypeName() as
+                    CompositeShaderType;
+            } else {
+                const submemObj = {};
+                parentObj[submemN] = submemObj;
+                queue.unshift([submemObj, submemN, submemMems]);
+            }
+        }
+    }
+
+    return objType;
 }
 
 /**
@@ -135,7 +297,9 @@ function prepRenderer() {
  */
 export async function render<T extends RenderFnState>(state: T): Promise<T> {
     if (!sab) {
-        console.error("Cannot begin rendering until the SharedArrayBuffer is set");
+        console.error(
+            "Cannot begin rendering until the SharedArrayBuffer is set"
+        );
         return state;
     }
 
@@ -146,7 +310,7 @@ export async function render<T extends RenderFnState>(state: T): Promise<T> {
     // Need to use Hann window function before FFT to reduce spectral leakage.
     // If wanting to combine channels' spectrums after FFT, use combined spectrum
     // with, for example, RMS/power combination
-    const { commonReflect, tsQuerySet, bufs, lyts, grps, pipes, sampAbQueue, logs } = state;
+    const { commonReflect, logs, glUniStore, tsQuerySet, bufs, comps, sampAbQueue, models } = state;
     const minFFTRatio = AudioDataManager.FFT_RATIO_MIN.value;
     const maxFFTRatio = AudioDataManager.FFT_RATIO_MAX.value;
     const maxFFTSize = 2 ** maxFFTRatio;
@@ -175,8 +339,10 @@ export async function render<T extends RenderFnState>(state: T): Promise<T> {
     // existing arraybuffers in the abQueue and input the back ab into
     // getSamples(), and only create a new ab if 2 abs don't already exist, or
     // the fft sizes change.
-    const manSampBuf = man.getSamples(0, 0, fftSize, processHeadIndex, -1).buffer
-        .transferToFixedLength(maxFFTSize * Float32Array.BYTES_PER_ELEMENT);
+    const manSampBuf = man.getSamples(0, 0, fftSize, processHeadIndex, -1)
+    .buffer
+    .transferToFixedLength(maxFFTSize * Float32Array.BYTES_PER_ELEMENT);
+
     normalizeArr(new Float32Array(manSampBuf));
     if (oldSampBuf !== undefined) {
         const oldSampArr = new Float32Array(oldSampBuf);
@@ -192,99 +358,90 @@ export async function render<T extends RenderFnState>(state: T): Promise<T> {
             manSampArr[i] = cerp(oldSampArr[i], manSampArr[i], 0.45);
         }
     }
-    device.queue.writeBuffer(
-        bufs.audioSampBuf, 0,
-        manSampBuf, 0,
-        manSampBuf.byteLength
-    );
+    bufs.audioSampBuf.write(manSampBuf);
     sampAbQueue.enqueue(manSampBuf);
 
-    if (fftSize !== state.lastFFTSize) {
-        const writerOut = glUniWriter(commonReflect, "fft.size", [fftSize]);
-        device.queue.writeBuffer(
-            bufs.glUniBuf,
-            writerOut.gpuBufOffset,
-            writerOut.byteData
-        );
-        writerOut.byteData.transferToFixedLength(0);
-    }
+    const t = man.getHeader("currentTime").currentTime;
+    glUniStore.setUniforms({
+        gl_uniforms: {
+            fft: { size: fftSize },
+            render: {
+                audio_t: man.getHeader("currentTime").currentTime,
+                runtime_t: performance.now(),
+                date_t: Date.now()
+            }
+        }
+    })
     state.lastFFTSize = fftSize;
 
-    const commandEncoder = device.createCommandEncoder();
+    const cmdEncoder = device.createCommandEncoder();
     const wkgrpCt = Math.ceil(fftSize / 64);
-    const preprocessPass = commandEncoder.beginComputePass({
-        timestampWrites: {
-            querySet: tsQuerySet,
-            beginningOfPassWriteIndex: 0,
-            endOfPassWriteIndex: 1
-        }
+    comps.preprocSampComp.predraw(cmdEncoder);
+    const preprocPass = cmdEncoder.beginComputePass({
+        timestampQuerySet: tsQuerySet,
+        beginTimestampIndex: 0,
+        endTimestampIndex: 1
     });
-    preprocessPass.setPipeline(pipes.preprocSampPipe);
-    preprocessPass.setBindGroup(0, grps.preprocSampGrp);
-    preprocessPass.dispatchWorkgroups(wkgrpCt);
-    preprocessPass.end();
+    comps.preprocSampComp.dispatch(preprocPass, wkgrpCt);
+    preprocPass.end();
 
-    const alignment = device.limits.minUniformBufferOffsetAlignment;
-    const stageStride = Math.ceil(4 / alignment) * alignment;
+    const stageAlign = device.limits.minUniformBufferOffsetAlignment;
     const stageCt = Math.log2(fftSize);
     const bflyWkgrpCt = Math.ceil(fftSize / 2 / 64);
-    const fftPass = commandEncoder.beginComputePass({
-        timestampWrites: {
-            querySet: tsQuerySet,
-            beginningOfPassWriteIndex: 2,
-            endOfPassWriteIndex: 3
-        }
+    comps.compFFTComp.predraw(cmdEncoder);
+    const fftPass = cmdEncoder.beginComputePass({
+        timestampQuerySet: tsQuerySet,
+        beginTimestampIndex: 2,
+        endTimestampIndex: 3
     });
-    fftPass.setPipeline(pipes.compFFTPipe);
     for (let stage=0; stage<stageCt; stage++) {
-        const fftGrp = stage % 2 === 0 ? grps.compFFTGrp : grps.compFFTPongGrp;
-        fftPass.setBindGroup(0, fftGrp, [stage * stageStride]);
-        fftPass.dispatchWorkgroups(bflyWkgrpCt);
+        const inBuf = stage % 2 === 0 ? bufs.complexSampBuf : bufs.fftBuf;
+        const outBuf = stage % 2 === 0 ? bufs.fftBuf : bufs.complexSampBuf;
+        comps.compFFTComp.setBindings({
+            fft_in: { buffer: inBuf },
+            fft_out: { buffer: outBuf },
+            stage_uni: {
+                buffer: bufs.stageUniBuf,
+                offset: stage * stageAlign,
+                size: 4
+            }
+        });
+        comps.compFFTComp.dispatch(fftPass, bflyWkgrpCt);
     }
     fftPass.end();
 
-    const magGrp = stageCt % 2 !== 0 ? grps.compMagGrp : grps.compMagPongGrp;
-    const magnitudePass = commandEncoder.beginComputePass({
-        timestampWrites: {
-            querySet: tsQuerySet,
-            beginningOfPassWriteIndex: 4,
-            endOfPassWriteIndex: 5
-        }
+    comps.compMagComp.predraw(cmdEncoder);
+    const magPass = cmdEncoder.beginComputePass({
+        timestampQuerySet: tsQuerySet,
+        beginTimestampIndex: 4,
+        endTimestampIndex: 5
     });
-    magnitudePass.setPipeline(pipes.compMagPipe);
-    magnitudePass.setBindGroup(0, magGrp);
-    magnitudePass.dispatchWorkgroups(wkgrpCt);
-    magnitudePass.end();
+    if (stageCt % 2 === 0) {
+        comps.compMagComp.setBindings({
+            mag_in: { buffer: bufs.complexSampBuf },
+            mag_out: { buffer: bufs.magBuf }
+        });
+    } else {
+        comps.compMagComp.setBindings({
+            mag_in: { buffer: bufs.fftBuf },
+            mag_out: { buffer: bufs.magBuf }
+        });
+    }
+    comps.compMagComp.dispatch(magPass, wkgrpCt);
+    magPass.end();
 
-    const renderPass = commandEncoder.beginRenderPass({
-        colorAttachments: [
-            {
-                clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-                loadOp: "clear",
-                storeOp: "store",
-                view: ctx!.getCurrentTexture()
-            }
-        ],
-        timestampWrites: {
-            querySet: tsQuerySet,
-            beginningOfPassWriteIndex: 6,
-            endOfPassWriteIndex: 7
-        }
+    models.renderModel.predraw(cmdEncoder);
+    const renderPass = cmdEncoder.beginRenderPass({
+        clearColor: [0,0,0,1],
+        timestampQuerySet: tsQuerySet,
+        beginTimestampIndex: 6,
+        endTimestampIndex: 7
     });
-    renderPass.setPipeline(pipes.renderSampPipe);
-    renderPass.setBindGroup(0, grps.renderSampGrp);
-    renderPass.draw(6, fftSize / 2);
+    models.renderModel.setVertexCount(6);
+    models.renderModel.setInstanceCount(fftSize / 2);
+    models.renderModel.draw(renderPass);
     renderPass.end();
-
-    commandEncoder.resolveQuerySet(
-        tsQuerySet,
-        0,
-        tsQuerySet.count,
-        bufs.tsQuerySetBuf,
-        0
-    );
-    commandEncoder.copyBufferToBuffer(bufs.tsQuerySetBuf, bufs.tsQuerySetReadBuf);
-    device.queue.submit([commandEncoder.finish()]);
+    device.submit(cmdEncoder.finish());
 
     return state;
 }
@@ -307,503 +464,45 @@ function cerp(a: number, b: number, t: number): number {
  * can choose to display in nanoseconds instead
  */
 export async function getShaderTimestampLogs(
-    tsQuerySetReadBuf: RenderFnState["bufs"]["tsQuerySetReadBuf"],
+    tsQuerySet: RenderFnState["tsQuerySet"],
     displayNs = false
 ) {
-    const readBufSize = tsQuerySetReadBuf.size;
-    await tsQuerySetReadBuf.mapAsync(GPUMapMode.READ, 0, readBufSize);
-    const tsAbCpy = tsQuerySetReadBuf.getMappedRange(0, readBufSize).slice();
-    tsQuerySetReadBuf.unmap();
+    // TODO: update this function and the documentation
+    return;
+    // const readBufSize = tsQuerySetReadBuf.size;
+    // await tsQuerySetReadBuf.mapAsync(GPUMapMode.READ, 0, readBufSize);
+    // const tsAbCpy = tsQuerySetReadBuf.getMappedRange(0, readBufSize).slice();
+    // tsQuerySetReadBuf.unmap();
 
-    const tsArr = new BigUint64Array(tsAbCpy);
-    const divisor = displayNs ? 1n : BigInt(1e+6);
-    const preprocT = (tsArr[1] - tsArr[0]) / divisor;
-    const fftT = (tsArr[3] - tsArr[2]) / divisor;
-    const magT = (tsArr[5] - tsArr[4]) / divisor;
-    const renderT = (tsArr[7] - tsArr[6]) / divisor;
-    tsAbCpy.transferToFixedLength(0);
+    // const tsArr = new BigUint64Array(tsAbCpy);
+    // const divisor = displayNs ? 1n : BigInt(1e+6);
+    // const preprocT = (tsArr[1] - tsArr[0]) / divisor;
+    // const fftT = (tsArr[3] - tsArr[2]) / divisor;
+    // const magT = (tsArr[5] - tsArr[4]) / divisor;
+    // const renderT = (tsArr[7] - tsArr[6]) / divisor;
+    // tsAbCpy.transferToFixedLength(0);
 
-    const getLblPrefix = (lbl: string) => lbl.substring(0, lbl.indexOf(":"));
-    const padLblPrefix = (lbl: string, spaceCt: number) => {
-        const colonI = lbl.indexOf(":");
-        return (
-            lbl.substring(0, colonI).padStart(spaceCt, " ") +
-            lbl.substring(colonI)
-        );
-    };
-    const tf = displayNs ? "ns" : "ms";
-    const lbls = [
-        `Preprocess: ${preprocT+tf}`,
-        `FFT: ${fftT+tf}`,
-        `Magnitude: ${magT+tf}`,
-        `Render: ${renderT+tf}`
-    ];
+    // const getLblPrefix = (lbl: string) => lbl.substring(0, lbl.indexOf(":"));
+    // const padLblPrefix = (lbl: string, spaceCt: number) => {
+    //     const colonI = lbl.indexOf(":");
+    //     return (
+    //         lbl.substring(0, colonI).padStart(spaceCt, " ") +
+    //         lbl.substring(colonI)
+    //     );
+    // };
+    // const tf = displayNs ? "ns" : "ms";
+    // const lbls = [
+    //     `Preprocess: ${preprocT+tf}`,
+    //     `FFT: ${fftT+tf}`,
+    //     `Magnitude: ${magT+tf}`,
+    //     `Render: ${renderT+tf}`
+    // ];
 
-    const longestLblLen = lbls.reduce((prev, curr) => {
-        return Math.max(prev, getLblPrefix(curr).length);
-    }, getLblPrefix(lbls[0]).length);
-    lbls.forEach((lbl, i) => lbls[i] = padLblPrefix(lbl, longestLblLen));
-    const logContent = lbls.join("\n");
+    // const longestLblLen = lbls.reduce((prev, curr) => {
+    //     return Math.max(prev, getLblPrefix(curr).length);
+    // }, getLblPrefix(lbls[0]).length);
+    // lbls.forEach((lbl, i) => lbls[i] = padLblPrefix(lbl, longestLblLen));
+    // const logContent = lbls.join("\n");
 
-    return logContent;
-}
-
-function createReqBuffers(commonReflect: WgslReflect, tsQuerySet: GPUQuerySet) {
-    const maxFFTSize = 2 ** AudioDataManager.FFT_RATIO_MAX.value;
-    const glUniBufSize = commonReflect.findResource(0, 0).size;
-    const glUniBuf = device.createBuffer({
-        size: glUniBufSize,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        label: "global_uniform_buffer"
-    });
-
-    const audioSampBuf = device.createBuffer({
-        size: maxFFTSize * 4,
-        usage: GPUBufferUsage.STORAGE
-            | GPUBufferUsage.COPY_DST
-            | GPUBufferUsage.COPY_SRC,
-        label: "audio_sample_buffer"
-    });
-
-    const compSampBuf = device.createBuffer({
-        size: audioSampBuf.size * 2,
-        usage: audioSampBuf.usage,
-        label: "complex_sample_buffer"
-    });
-
-    const fftBuf = device.createBuffer({
-        size: compSampBuf.size,
-        usage: audioSampBuf.usage,
-        label: "fft_buffer"
-    });
-
-    const alignment = device.limits.minUniformBufferOffsetAlignment;
-    const stageStride = Math.ceil(4 / alignment) * alignment;
-    const stageCt = Math.log2(maxFFTSize);
-    const stageBuf = device.createBuffer({
-        size: stageStride * stageCt,
-        usage: glUniBuf.usage
-    });
-    for (let stage=0; stage<stageCt; stage++) {
-        const value = new Uint32Array([stage]);
-        // console.log(`Stage stride: ${stageStride}`);
-        device.queue.writeBuffer(stageBuf, stage * stageStride, value);
-    }
-
-    const magBuf = device.createBuffer({
-        size: audioSampBuf.size,
-        usage: audioSampBuf.usage,
-        label: "magnitude_buffer"
-    });
-
-    const tsQuerySetBuf = device.createBuffer({
-        size: tsQuerySet.count * 8,
-        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
-    });
-    const tsQuerySetReadBuf = device.createBuffer({
-        size: tsQuerySetBuf.size,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
-    });
-
-    return {
-        glUniBuf,
-        audioSampBuf,
-        compSampBuf,
-        fftBuf,
-        stageBuf,
-        magBuf,
-        tsQuerySetBuf,
-        tsQuerySetReadBuf
-    };
-}
-
-/**
- * Creates bind group layouts, NOT pipeline layouts
- * @returns 
- */
-function createReqLayouts() {
-    const preprocSampLyt = device.createBindGroupLayout({
-        entries: [
-            {
-                binding: 0,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "uniform"
-                }
-            },
-            {
-                binding: 1,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "read-only-storage"
-                }
-            },
-            {
-                binding: 2,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "storage"
-                }
-            }
-        ]
-    });
-    const compFFTLyt = device.createBindGroupLayout({
-        entries: [
-            {
-                binding: 0,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "uniform"
-                }
-            },
-            {
-                binding: 1,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "read-only-storage"
-                }
-            },
-            {
-                binding: 2,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "storage"
-                }
-            },
-            {
-                binding: 3,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "uniform",
-                    hasDynamicOffset: true
-                }
-            }
-        ]
-    });
-    const compMagLyt = device.createBindGroupLayout({
-        entries: [
-            {
-                binding: 0,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "uniform"
-                }
-            },
-            {
-                binding: 1,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "read-only-storage"
-                }
-            },
-            {
-                binding: 2,
-                visibility: GPUShaderStage.COMPUTE,
-                buffer: {
-                    type: "storage"
-                }
-            }
-        ]
-    });
-    const renderSampLyt = device.createBindGroupLayout({
-        entries: [
-            {
-                binding: 0,
-                visibility: GPUShaderStage.VERTEX,
-                buffer: {
-                    type: "uniform"
-                }
-            },
-            {
-                binding: 1,
-                visibility: GPUShaderStage.VERTEX,
-                buffer: {
-                    type: "read-only-storage"
-                }
-            }
-        ]
-    });
-
-    return {
-        preprocSampLyt,
-        compFFTLyt,
-        compMagLyt,
-        renderSampLyt
-    };
-}
-
-function createReqGroups(
-    bufs: RenderFnState["bufs"],
-    lyts: RenderFnState["lyts"]
-) {
-    const preprocSampGrp = device.createBindGroup({
-        layout: lyts.preprocSampLyt,
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: bufs.glUniBuf
-                }
-            },
-            {
-                binding: 1,
-                resource: {
-                    buffer: bufs.audioSampBuf
-                }
-            },
-            {
-                binding: 2,
-                resource: {
-                    buffer: bufs.compSampBuf
-                }
-            }
-        ],
-        label: "preprocessSamplesGroup"
-    });
-    const compFFTGrp = device.createBindGroup({
-        layout: lyts.compFFTLyt,
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: bufs.glUniBuf
-                }
-            },
-            {
-                binding: 1,
-                resource: {
-                    buffer: bufs.compSampBuf
-                }
-            },
-            {
-                binding: 2,
-                resource: {
-                    buffer: bufs.fftBuf
-                }
-            },
-            {
-                binding: 3,
-                resource: {
-                    buffer: bufs.stageBuf,
-                    size: 4
-                }
-            }
-        ],
-        label: "computeFFTGroup"
-    });
-    const compFFTPongGrp = device.createBindGroup({
-        layout: lyts.compFFTLyt,
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: bufs.glUniBuf
-                }
-            },
-            {
-                binding: 2,
-                resource: {
-                    buffer: bufs.compSampBuf
-                }
-            },
-            {
-                binding: 1,
-                resource: {
-                    buffer: bufs.fftBuf
-                }
-            },
-            {
-                binding: 3,
-                resource: {
-                    buffer: bufs.stageBuf,
-                    size: 4
-                }
-            }
-        ],
-        label: "computeFFTPongGroup"
-    });
-    const compMagGrp = device.createBindGroup({
-        layout: lyts.compMagLyt,
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: bufs.glUniBuf
-                }
-            },
-            {
-                binding: 1,
-                resource: {
-                    buffer: bufs.fftBuf
-                }
-            },
-            {
-                binding: 2,
-                resource: {
-                    buffer: bufs.magBuf
-                }
-            }
-        ],
-        label: "computeMagnitudeGroup"
-    });
-    const compMagPongGrp = device.createBindGroup({
-        layout: lyts.compMagLyt,
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: bufs.glUniBuf
-                }
-            },
-            {
-                binding: 1,
-                resource: {
-                    buffer: bufs.compSampBuf
-                }
-            },
-            {
-                binding: 2,
-                resource: {
-                    buffer: bufs.magBuf
-                }
-            }
-        ],
-        label: "computeMagnitudeGroup"
-    });
-    const renderSampGrp = device.createBindGroup({
-        layout: lyts.renderSampLyt,
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: bufs.glUniBuf
-                }
-            },
-            {
-                binding: 1,
-                resource: {
-                    buffer: bufs.magBuf
-                }
-            }
-        ]
-    });
-
-    return {
-        preprocSampGrp,
-        compFFTGrp,
-        compFFTPongGrp,
-        compMagGrp,
-        compMagPongGrp,
-        renderSampGrp
-    };
-}
-
-function createReqPipelines(
-    fftShader: GPUShaderModule,
-    renderShader: GPUShaderModule,
-    lyts: RenderFnState["lyts"]
-) {
-    const preprocSampPipe = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [lyts.preprocSampLyt]
-        }),
-        compute: {
-            module: fftShader,
-            entryPoint: "preprocess_samples"
-        }
-    });
-    const compFFTPipe = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [lyts.compFFTLyt]
-        }),
-        compute: {
-            module: fftShader,
-            entryPoint: "fft_stage"
-        }
-    });
-    const compMagPipe = device.createComputePipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [lyts.compMagLyt]
-        }),
-        compute: {
-            module: fftShader,
-            entryPoint: "magnitude"
-        }
-    });
-    const renderSampPipe = device.createRenderPipeline({
-        layout: device.createPipelineLayout({
-            bindGroupLayouts: [lyts.renderSampLyt]
-        }),
-        vertex: {
-            module: renderShader,
-            entryPoint: "vert_main"
-        },
-        fragment: {
-            module: renderShader,
-            entryPoint: "frag_main",
-            targets: [{ format: navigator.gpu.getPreferredCanvasFormat() }]
-        },
-        primitive: {
-            topology: "triangle-list"
-        }
-    });
-
-    return {
-        preprocSampPipe,
-        compFFTPipe,
-        compMagPipe,
-        renderSampPipe
-    };
-}
-
-/**
- * Ensures conventions of the "common.wgsl" shader are preserved.
- * @param reflect 
- * @returns If valid, returns 0.
- */
-function validateCommonShader(reflect: WgslReflect): number {
-    const groups = reflect.getBindGroups();
-    for (let i=0; i<groups.length; i++) {
-        const glUniVarInfo = groups[i][0];
-        if (!glUniVarInfo) continue;
-        const prevGlUniVarInfo = groups[Math.max(0, i-1)][0];
-        
-        const glUniAccess = glUniVarInfo.access;
-        if (glUniAccess !== "read") {
-            console.error(
-                `Access for global uniform variable must be unset (${glUniAccess})`
-            );
-            return 1;
-        }
-
-        const glUniRes = glUniVarInfo.resourceType;
-        if (glUniRes !== ResourceType.Uniform) {
-            console.error(
-                `Resource type of global uniform variable must be`+
-                `set to 'uniform' (${glUniRes})`
-            );
-            return 1;
-        }
-
-        const currTypeName = glUniVarInfo.type.getTypeName();
-        const prevTypeName = prevGlUniVarInfo.type.getTypeName();
-        if (currTypeName !== prevTypeName) {
-            const prevGrpI = Math.max(0, i-1);
-            console.error(
-                `Type name of global uniform variable at @group(${i}) @binding(0) `+
-                `does not match @group(${prevGrpI}): `+
-                `${currTypeName} != ${prevTypeName}`
-            );
-            return 1;
-        }
-
-        // if (name !== "global_uniforms") {
-        //     console.error(
-        //         `Global uniform variable must be named "global_uniforms" (${name})`
-        //     );
-        //     return 1;
-        // }
-    }
-
-    return 0;
+    // return logContent;
 }

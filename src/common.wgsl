@@ -1,6 +1,6 @@
 struct GlobalUniforms {
     fft: FFTUniforms,
-    // render: RenderUniforms
+    @align(16) render: RenderUniforms
 }
 
 struct FFTUniforms {
@@ -9,7 +9,10 @@ struct FFTUniforms {
 }
 
 struct RenderUniforms {
-    time: u32
+    audio_t: u32,
+    audio_len: u32,
+    runtime_t: u32,
+    date_t: u32
 }
 
 const PI: f32 = 245850922.0 / 78256779.0;

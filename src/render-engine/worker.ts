@@ -1,6 +1,6 @@
 import AudioDataManager from "../analyser/AudioDataManager";
 import strictObjectAssign from "../utils/strictObjectAssign";
-import { RenderFnState, sab, ctx, init, render, getShaderTimestampLogs }
+import { RenderFnState, device, sab, init, render, getShaderTimestampLogs }
     from "./renderHandler";
 
 export type WorkerInitData = {
@@ -78,7 +78,7 @@ function handleMessage(e: MessageEvent<WorkerMessagePayload>): void {
             break;
         }
         case "get-bitmap": {
-            if (!ctx) {
+            if (!device || !device.canvasContext) {
                 console.error(
                     "Cannot retrieve ImageBitmap from rendering canvas - "+
                     "uninitialized canvas context"
@@ -86,7 +86,8 @@ function handleMessage(e: MessageEvent<WorkerMessagePayload>): void {
                 return;
             }
             
-            const bitmap = (ctx.canvas as OffscreenCanvas).transferToImageBitmap();
+            const bitmap = (device.canvasContext.canvas as OffscreenCanvas)
+            .transferToImageBitmap();
             const messagePayload: WorkerMessagePayload = {
                 type: "get-bitmap",
                 data: bitmap
@@ -108,12 +109,12 @@ function handleRenderLoop(fps: number) {
         if (force ||
             (renderState!.sampChanged && (t >= logs.lastLogTs + logIntMs))
         ) {
-            logs.lastLogTs = t;
-            const logContent = await getShaderTimestampLogs(
-                renderState!.bufs.tsQuerySetReadBuf,
-                true
-            );
-            console.log(logContent);
+            // logs.lastLogTs = t;
+            // const logContent = await getShaderTimestampLogs(
+            //     renderState!.bufs.tsQuerySetReadBuf,
+            //     true
+            // );
+            // console.log(logContent);
         }
     }
 
@@ -122,7 +123,7 @@ function handleRenderLoop(fps: number) {
         const loopFn = async (ts: DOMHighResTimeStamp) => {
             if (renderState) {
                 await render(renderState);
-                await logShaders();
+                // await logShaders();
             }
             renderReqAnimFrameId = requestAnimationFrame(loopFn);
         };
@@ -136,7 +137,7 @@ function handleRenderLoop(fps: number) {
                 if (renderCt >= totalRenderCt) return;
                 renderCt++;
                 await render(renderState);
-                await logShaders();
+                // await logShaders();
             }
             renderReqAnimFrameId = requestAnimationFrame(loopFn);
         };
@@ -149,7 +150,7 @@ function handleRenderLoop(fps: number) {
             if (renderState && doneRendering) {
                 doneRendering = false;
                 await render(renderState);
-                await logShaders();
+                // await logShaders();
                 doneRendering = true;
             }
         }, 1000 / fps);
