@@ -305,7 +305,11 @@ export class Float16 implements NumberWrapperInterface {
 
     public static normalizeValue(value: number): number {
         value = Math.min(Math.max(Float16.MIN, value), Float16.MAX);
-        return roundToDecimal(value, Float16.DECIMAL_DIGITS);
+        if (Number.isNaN(value)) {
+            value = 0;
+        }
+        // return roundToDecimal(value, Float16.DECIMAL_DIGITS);
+        return Math.f16round(value);
     }
 }
 interface Float16Constructor extends FloatWrapperConstructor {
@@ -336,7 +340,11 @@ export class Float32 implements NumberWrapperInterface {
 
     public static normalizeValue(value: number): number {
         value = Math.min(Math.max(Float32.MIN, value), Float32.MAX);
-        return roundToDecimal(value, Float32.DECIMAL_DIGITS);
+        if (Number.isNaN(value)) {
+            value = 0;
+        }
+        // return roundToDecimal(value, Float32.DECIMAL_DIGITS);
+        return Math.fround(value);
     }
 }
 interface Float32Constructor extends FloatWrapperConstructor {
@@ -367,7 +375,11 @@ export class Float64 implements NumberWrapperInterface {
 
     public static normalizeValue(value: number): number {
         value = Math.min(Math.max(Float64.MIN, value), Float64.MAX);
-        return roundToDecimal(value, Float64.DECIMAL_DIGITS);
+        if (Number.isNaN(value)) {
+            value = 0;
+        }
+        // return roundToDecimal(value, Float64.DECIMAL_DIGITS);
+        return value;
     }
 }
 interface Float64Constructor extends FloatWrapperConstructor {

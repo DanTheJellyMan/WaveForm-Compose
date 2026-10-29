@@ -329,11 +329,6 @@ export async function render<T extends RenderFnState>(state: T): Promise<T> {
     }
     const { processHeadIndex } = manHeader;
 
-    const normalizeArr = (arr: Float32Array): void => {
-        for (let i=0; i<arr.length; i++) {
-            arr[i] = Float32.normalizeValue(arr[i]);
-        }
-    }
     const fftSize = 2 ** manHeader.fftRatio;
     // TODO: instead of always creating a new array from getSamples(), use 2
     // existing arraybuffers in the abQueue and input the back ab into
@@ -343,11 +338,14 @@ export async function render<T extends RenderFnState>(state: T): Promise<T> {
     .buffer
     .transferToFixedLength(maxFFTSize * Float32Array.BYTES_PER_ELEMENT);
 
-    normalizeArr(new Float32Array(manSampBuf));
     if (oldSampBuf !== undefined) {
-        const oldSampArr = new Float32Array(oldSampBuf);
-        const manSampArr = new Float32Array(manSampBuf);
+        const oldSampArr = new Float32Array(oldSampBuf)
+        const manSampArr = new Float32Array(manSampBuf)
+        // .map((val) => Float32.normalizeValue(val));
+        // TODO: fix array comparisons never equaling true when audio is paused, and
+        // the jittering during playback when manSampArr is normalized
         if (arrayEquals(oldSampArr, manSampArr)) {
+            sampAbQueue.enqueue(manSampBuf);
             state.sampChanged = false;
             return state;
         }

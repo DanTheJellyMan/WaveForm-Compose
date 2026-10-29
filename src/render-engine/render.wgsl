@@ -31,8 +31,9 @@ fn vert_main(
     let runtime_t = gl_uniforms.render.runtime_t;
     let date_t = gl_uniforms.render.date_t;
 
-    // db: [-120, 0]
+    // db: [-120.0, 0.0]
     let db = samps_db[samp_i];
+    let db_p = db / 120.0 + 1.0;
     let samp_ct = gl_uniforms.fft.size / 2u;
     let width = 2.0 / f32(samp_ct);
 
@@ -63,12 +64,15 @@ fn vert_main(
     let pos = vec4f(x, y, 0.5, 1.0);
 
     let prog_x = abs((f32(samp_i) +
-        (sin(f32(runtime_t)*0.0000125)+1.0)*1750.0 * 1.0
+        (sin(f32(runtime_t)*0.0000125%2)+1.0)*1750.0 * 1.0
     ) % f32(samp_ct) / f32(samp_ct));
     let prog_y = (y + 1.0) / 2.0;
-    let l = 0.5;
-    let c = 0.15;
-    let h = prog_x * 2.0 * PI;
+    var l = 0.425;
+    var c = 0.12;
+    
+    var height_hue_offset_deg_range = 60.0;
+    var height_hue_offset = height_hue_offset_deg_range*db_p*2*PI/180.0;
+    var h = prog_x * 2.0 * PI - height_hue_offset;
 
     let lab = oklch_to_oklab(Oklch(l, c, h));
     let rgb = encode_linear_srgb(oklab_to_linear_srgb(lab));
